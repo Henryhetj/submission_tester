@@ -385,22 +385,36 @@ copy_exit_is_success <- function(exit_code) {
   if (IS_WINDOWS) exit_code < 8 else exit_code == 0
 }
 
-# Build the actual Rscript invocation for one program. When `use_clean_lib`
-# is TRUE, don't run the program file directly -- instead write a tiny
-# wrapper script that forces .libPaths() to [clean_lib_dir, base R only]
-# BEFORE sourcing the real program. include.site = FALSE is required: R's
-# .libPaths() silently re-adds the site library by default even when you
-# pass an explicit new vector, unless you turn that off.
+# Achieves the "clean package library" isolation via environment variables
+# set BEFORE the R process starts (R_LIBS_USER/R_LIBS_SITE/R_LIBS), instead of
+# a .libPaths()-in-a-wrapper-script + source() approach.
+#
+# Why: wrapping the target program in `source(program_path)` changes how
+# on.exit() behaves for any top-level (not-inside-a-function) on.exit() calls
+# in the target program -- R attaches such calls to the per-statement eval
+# frame source() creates, so they fire as soon as the enclosing block
+# finishes, not at the true end of the script. Programs whose own cleanup
+# logic (sink()/close() for a log file, commonly) relies on running once at
+# the very end can then crash ("invalid connection", "no sink to remove")
+# purely because of HOW they were invoked -- identical code, different
+# result, depending on source() vs direct execution. Confirmed via a minimal
+# repro. Setting R_LIBS_* as process environment variables instead means the
+# target script is still the literal top-level entry point of the Rscript
+# process (exactly as when run directly or from RStudio), so this class of
+# bug can't be triggered by this app at all.
 build_launch_args <- function(program_path, use_clean_lib, clean_lib_dir) {
   if (!isTRUE(use_clean_lib)) {
-    return(list(flags = character(0), script = program_path))
+    return(list(flags = character(0), script = program_path, env = "current"))
   }
-  wrapper_path <- tempfile(fileext = ".R")
-  writeLines(c(
-    sprintf(".libPaths(c(%s, .Library), include.site = FALSE)", deparse(clean_lib_dir)),
-    sprintf("source(%s, chdir = TRUE)", deparse(program_path))
-  ), wrapper_path)
-  list(flags = "--vanilla", script = wrapper_path)
+  nonexistent_site_dir <- file.path(clean_lib_dir, "_no_site_library")
+  list(
+    flags = "--vanilla",
+    script = program_path,
+    env = c("current",
+            R_LIBS_USER = clean_lib_dir,
+            R_LIBS_SITE = nonexistent_site_dir,
+            R_LIBS = clean_lib_dir)
+  )
 }
 
 # ---------------------------------------------------------------------------
@@ -963,22 +977,46 @@ server <- function(input, output, session) {
     if (!is.null(rv$run_current_proc)) {
       proc <- rv$run_current_proc
       if (!proc$is_alive()) {
-        exit_code <- proc$get_exit_status()
-        elapsed <- as.numeric(difftime(Sys.time(), rv$run_current_start, units = "secs"))
-        status <- if (!is.na(exit_code) && exit_code == 0) "SUCCESS" else "FAILED"
-        log_txt <- tryCatch(paste(readLines(rv$run_current_log, warn = FALSE), collapse = "\n"),
-                            error = function(e) "")
-        rv$run_results[[basename(rv$run_current_program)]] <- list(
-          program = basename(rv$run_current_program),
-          exit_code = exit_code,
-          status = status,
-          seconds = round(elapsed, 1),
-          start_time = rv$run_current_start,
-          log = log_txt,
-          log_file = rv$run_current_log
-        )
-        add_log(sprintf("Finished: %s -- %s (exit=%s, %.1fs)",
-                        basename(rv$run_current_program), status, exit_code, elapsed))
+        tryCatch({
+          exit_code <- proc$get_exit_status()
+          elapsed <- as.numeric(difftime(Sys.time(), rv$run_current_start, units = "secs"))
+          status <- if (!is.na(exit_code) && exit_code == 0) "SUCCESS" else "FAILED"
+          prog_name <- basename(rv$run_current_program)
+          log_txt <- tryCatch({
+            raw <- paste(readLines(rv$run_current_log, warn = FALSE), collapse = "\n")
+            # Program output can legitimately contain non-UTF-8 bytes (locale-
+            # dependent characters, garbled output from a crashing package,
+            # etc.) -- replace invalid byte sequences instead of letting
+            # downstream string ops (trimws, sub, ...) throw on them.
+            iconv(raw, from = "UTF-8", to = "UTF-8", sub = "byte")
+          }, error = function(e) "")
+          
+          rv$run_results[[prog_name]] <- list(
+            program = prog_name,
+            exit_code = exit_code,
+            status = status,
+            seconds = round(elapsed, 1),
+            start_time = rv$run_current_start,
+            log = log_txt,
+            log_file = rv$run_current_log
+          )
+          add_log(sprintf("Finished: %s -- %s (exit=%s, %.1fs)", prog_name, status, exit_code, elapsed))
+          
+          if (status == "FAILED" && nzchar(trimws(log_txt))) {
+            lines <- strsplit(log_txt, "\n", fixed = TRUE)[[1]]
+            n_show <- 40
+            shown <- if (length(lines) > n_show) utils::tail(lines, n_show) else lines
+            note <- if (length(lines) > n_show) sprintf(" (last %d of %d lines)", n_show, length(lines)) else ""
+            add_log(sprintf("Error output for %s%s:\n%s", prog_name, note, paste(shown, collapse = "\n")))
+          }
+        }, error = function(e) {
+          # Never let an unexpected error here stall the run loop forever --
+          # log it and still let the queue move on (state cleared below,
+          # outside this tryCatch, unconditionally).
+          add_log(sprintf("Internal error while finishing %s: %s",
+                          basename(rv$run_current_program), conditionMessage(e)))
+        })
+        
         rv$run_current_proc <- NULL
         rv$run_current_program <- NULL
       } else {
@@ -1002,6 +1040,7 @@ server <- function(input, output, session) {
           # OS process (no shell involved), so shell-quoting would inject
           # literal quote characters into the path and break it.
           args = c(launch$flags, launch$script),
+          env = launch$env,
           wd = cwd,
           stdout = log_path,
           stderr = log_path
