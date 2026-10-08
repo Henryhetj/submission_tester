@@ -1,38 +1,11 @@
 #############################################################################
-# Submission File Local Test Runner (Shiny app)
+# SAFE -- Submission Assessment For Executables (Shiny app)
 #
 # Purpose:
-#   Simulate the FDA reviewer's local environment (where all submission
-#   files live under a hardcoded "C:/submission_files/...") by:
-#     1) Copying the "final" submission_files folder from the server path
-#        to a local/mapped drive on the Citrix machine (drive letter is a
-#        parameter, e.g. "Y:", because different users may be assigned
-#        different drive letters).
-#     2) Scanning all program files for the hardcoded source drive letter
-#        (e.g. "C:/...") and replacing it with the target drive letter
-#        (e.g. "Y:/...") -- IN THE COPY ONLY. The original "C:/" master
-#        version on the server is never touched.
-#     3) Running the (now drive-letter-adjusted) programs with Rscript,
-#        one at a time, capturing logs and exit codes.
-#     4) Checking whether the expected output files were actually produced
-#        (exists, non-empty, freshly modified after the run started).
-#
-# NOTES / OPEN QUESTIONS (intentionally left as configurable parameters so
-# we can iterate during testing, per your message):
-#   - Whether Rscript needs to be installed locally on the Citrix machine,
-#     or whether it's acceptable to point `rscript_path` at a network/
-#     server R installation, is left as a parameter (`rscript_path`).
-#     Recommendation: use a LOCAL R install on the Citrix machine so the
-#     test genuinely mimics an FDA reviewer's local-only environment.
-#   - "Y:" in your screenshot is a mapped network drive
-#     (\\brick.d51.lilly.com\<username>), not the physical local disk of
-#     the Citrix VM. Functionally this is fine -- Windows/R treat mapped
-#     drives and local disks identically for file I/O -- but it will be
-#     slower than a true local disk, so large copies may take longer.
-#   - Output completeness checking uses a naming heuristic: assume each
-#     program "foo.R" should produce an output file "foo.<ext>" for ext in
-#     `output_extensions` (default rtf/docx/svg).
-#     This is a first pass -- refine once we see real output patterns.
+#   Provides a local pre-check of submission executable programs before
+#   FDA review: sets up a local working copy of the submission files, runs
+#   the programs against it, and checks that the expected outputs were
+#   produced.
 #
 # Required packages (install via your internal Artifactory-backed CRAN
 # mirror per company policy -- do NOT use public CRAN/npm directly):
@@ -79,6 +52,8 @@ DEFAULT_DEST_ROOT <- if (IS_WINDOWS) {
 # package follows the same structure: programs/ and output/ live side by
 # side directly under the destination root.
 PROGRAMS_SUBDIR <- "programs"
+# Dedicated package library for the Windows run, at the root of the user's drive.
+WIN_LIB_DIRNAME <- "safe_r_lib"
 OUTPUT_SUBDIR <- "output"
 OUTPUT_EXTENSIONS <- c("rtf", "docx", "svg")
 
@@ -90,12 +65,43 @@ normalize_prefix <- function(p) {
   sub("[/\\\\]+$", "", p)
 }
 
+# Convert a path as seen from THIS (Linux) session into the equivalent
+# Windows path, for use inside a generated .bat file that will actually run
+# on the Windows side. Relies on the shared-storage mapping confirmed
+# earlier (this session's home directory and the person's mapped Windows
+# drive point at the same underlying storage) -- strips the Linux home
+# prefix and re-roots the remaining relative structure under the Windows
+# drive letter, converting slash direction along the way.
+to_windows_path <- function(linux_path, linux_home, windows_drive) {
+  linux_home <- normalize_prefix(linux_home)
+  windows_drive <- normalize_prefix(windows_drive)
+  rel <- if (startsWith(linux_path, linux_home)) {
+    substring(linux_path, nchar(linux_home) + 1)
+  } else {
+    linux_path
+  }
+  rel <- gsub("/", "\\\\", rel)
+  rel <- sub("^\\\\+", "", rel)
+  paste0(windows_drive, "\\", rel)
+}
+
 # Strip a literal prefix from the start of a string, for display purposes.
 # Deliberately NOT regex-based (no escaping needed, no risk of the prefix
 # containing regex metacharacters that break pattern compilation) -- just a
 # plain substring check.
 strip_prefix_literal <- function(x, prefix) {
   ifelse(startsWith(x, prefix), substring(x, nchar(prefix) + 1), x)
+}
+
+# Rewrite any occurrence of the local test root back to the original
+# hardcoded path, in free-form text (e.g. captured program output/errors).
+# Deliberately a plain literal string replacement (fixed = TRUE), not
+# regex-based -- program output is arbitrary text we don't control, and a
+# regex approach risks the exact "invalid regex" class of bug fixed earlier
+# if the path ever contains characters like parentheses.
+restore_hardcoded_path_in_text <- function(text, test_root, hardcoded_root) {
+  if (!nzchar(test_root) || is.na(text)) return(text)
+  gsub(test_root, hardcoded_root, text, fixed = TRUE)
 }
 
 # Order program file paths so ones ending in "_tf" (self-contained, no
@@ -339,11 +345,271 @@ apply_drive_replace <- function(files, patterns, replacement_prefix, ignore_case
   do.call(rbind, out)
 }
 
+# Replace any hardcoded reference to THIS session's own (Linux) home
+# directory with the equivalent Windows drive-letter path -- needed
+# because a program (or something it source()s, like autoexec.R) can
+# hardcode a path built for the Linux test run specifically (separate from
+# the standard "C:/..." convention apply_drive_replace() already handles),
+# which is meaningless when the same file is handed to a Windows R engine
+# instead. Uses forward slashes in the replacement, since that's valid in
+# R source code on Windows too and needs no backslash-escaping the way a
+# literal backslash would inside a quoted R string.
+apply_linux_home_to_windows_replace <- function(files, linux_home, windows_drive) {
+  linux_home <- normalize_prefix(linux_home)
+  windows_drive <- normalize_prefix(windows_drive)
+  pattern <- paste0(linux_home, "/")
+  replacement <- paste0(windows_drive, "/")
+  
+  out <- lapply(files, function(f) {
+    txt <- read_file_text(f)
+    if (is.na(txt)) {
+      return(data.frame(file = f, n_replaced = NA, status = "READ_FAILED", stringsAsFactors = FALSE))
+    }
+    orig <- txt
+    n_matches <- count_occurrences(txt, pattern)
+    txt <- gsub(pattern, replacement, txt, fixed = TRUE)
+    if (identical(orig, txt)) {
+      return(data.frame(file = f, n_replaced = 0, status = "NO_CHANGE", stringsAsFactors = FALSE))
+    }
+    ok <- tryCatch({ write_file_text(f, txt); TRUE }, error = function(e) FALSE)
+    data.frame(file = f, n_replaced = if (ok) n_matches else NA,
+               status = if (ok) "REPLACED" else "WRITE_FAILED", stringsAsFactors = FALSE)
+  })
+  do.call(rbind, out)
+}
+
 # Guess the expected output file(s) for a program using a naming heuristic.
 guess_expected_outputs <- function(program_file, output_dir, output_extensions) {
   base <- tools::file_path_sans_ext(basename(program_file))
   candidates <- file.path(output_dir, paste0(base, ".", output_extensions))
   candidates
+}
+
+# Compare each local .rtf/.docx output against a same-named file in
+# server_dir (top level only -- no subfolder search). Returns a single
+# pipe-separated summary string, or NA if there's nothing to compare.
+# Neutralize absolute file paths (Windows or Unix style) in extracted text
+# before comparing -- footnotes that record "Program Location: /home/.../
+# programs/foo.R" etc. will always differ between the local test copy and
+# the server original, even when the actual content is identical, since the
+# two environments live at different paths.
+normalize_paths_for_compare <- function(text) {
+  # Restricted to actual path characters (letters, digits, underscore, dot,
+  # hyphen, forward slash) -- deliberately excludes backslash, since every
+  # hardcoded path seen in these programs uses forward slashes even for the
+  # "C:" drive (e.g. "C:/submission_files/..."), and a looser character
+  # class would swallow trailing RTF control words (e.g. "\par") that
+  # happen to follow a path with no space in between.
+  text <- gsub("[A-Za-z]:/[A-Za-z0-9_./-]*", "<PATH>", text, perl = TRUE)
+  text <- gsub("/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+", "<PATH>", text, perl = TRUE)
+  text
+}
+
+# Extract a comparable text representation of an .rtf or .docx file.
+# - .rtf is already largely plain text (with RTF control words mixed in),
+#   so it can be read directly.
+# - .docx is a zip archive; word/document.xml holds the visible text, so
+#   that's extracted and treated as text. This deliberately avoids adding a
+#   dependency on a document-parsing package (e.g. officer) just for a
+#   same-file-or-not comparison.
+# Returns NA on any failure, so the caller can fall back to a raw MD5
+# comparison instead.
+extract_comparable_text <- function(path) {
+  ext <- tolower(tools::file_ext(path))
+  if (ext == "docx") {
+    tmp_dir <- tempfile("docxcmp")
+    dir.create(tmp_dir)
+    on.exit(unlink(tmp_dir, recursive = TRUE), add = TRUE)
+    ok <- tryCatch({
+      utils::unzip(path, files = "word/document.xml", exdir = tmp_dir)
+      TRUE
+    }, error = function(e) FALSE, warning = function(w) FALSE)
+    xml_path <- file.path(tmp_dir, "word", "document.xml")
+    if (!ok || !file.exists(xml_path)) return(NA_character_)
+    tryCatch(paste(readLines(xml_path, warn = FALSE, encoding = "UTF-8"), collapse = "\n"),
+             error = function(e) NA_character_)
+  } else {
+    tryCatch(paste(readLines(path, warn = FALSE, encoding = "UTF-8"), collapse = "\n"),
+             error = function(e) NA_character_)
+  }
+}
+
+# Find the first point where two strings diverge and return a short,
+# human-scannable snippet of context around it -- much more actionable in a
+# results table than a bare "DIFFERENT", without dumping the whole file.
+find_diff_snippet <- function(text1, text2, context = 15) {
+  if (identical(text1, text2)) return("")
+  n <- min(nchar(text1), nchar(text2))
+  if (n == 0) return("one file is empty")
+  c1 <- utf8ToInt(substr(text1, 1, n))
+  c2 <- utf8ToInt(substr(text2, 1, n))
+  diffs <- which(c1 != c2)
+  diff_pos <- if (length(diffs) > 0) diffs[1] else n + 1
+  start <- max(1, diff_pos - context)
+  snippet1 <- trimws(substr(text1, start, diff_pos + context))
+  snippet2 <- trimws(substr(text2, start, diff_pos + context))
+  snippet1 <- gsub("[[:space:]]+", " ", snippet1)
+  snippet2 <- gsub("[[:space:]]+", " ", snippet2)
+  sprintf("local '...%s...' vs server '...%s...'", snippet1, snippet2)
+}
+
+compare_outputs_to_server <- function(local_files, server_dir) {
+  targets <- local_files[grepl("\\.(rtf|docx)$", local_files, ignore.case = TRUE)]
+  if (length(targets) == 0) return(NA_character_)
+  if (is.null(server_dir) || !nzchar(trimws(server_dir)) || !dir.exists(server_dir)) {
+    return("SERVER_PATH_NOT_FOUND")
+  }
+  results <- vapply(targets, function(f) {
+    ext_tag <- toupper(tools::file_ext(f))
+    server_file <- file.path(server_dir, basename(f))
+    if (!file.exists(server_file)) return(paste0(ext_tag, ": SERVER_MISSING"))
+    
+    local_txt <- extract_comparable_text(f)
+    server_txt <- extract_comparable_text(server_file)
+    
+    if (is.na(local_txt) || is.na(server_txt)) {
+      # Text extraction failed -- fall back to a raw MD5 comparison rather
+      # than silently skipping this file.
+      local_md5 <- tryCatch(unname(tools::md5sum(f)), error = function(e) NA_character_)
+      server_md5 <- tryCatch(unname(tools::md5sum(server_file)), error = function(e) NA_character_)
+      if (is.na(local_md5) || is.na(server_md5)) return(paste0(ext_tag, ": COMPARE_FAILED"))
+      return(if (identical(local_md5, server_md5)) paste0(ext_tag, ": MATCH") else paste0(ext_tag, ": DIFFERENT"))
+    }
+    
+    local_norm <- normalize_paths_for_compare(local_txt)
+    server_norm <- normalize_paths_for_compare(server_txt)
+    if (identical(local_norm, server_norm)) {
+      paste0(ext_tag, ": MATCH")
+    } else {
+      snippet <- find_diff_snippet(local_norm, server_norm)
+      paste0(ext_tag, ": DIFFERENT (", snippet, ")")
+    }
+  }, character(1))
+  paste(results, collapse = " | ")
+}
+
+# Compare a program's _ards.csv against the server version. PROGRAM/OUTPUT
+# columns are always excluded -- they literally record the local vs. server
+# file paths, so they're expected to differ even when everything else
+# matches. Numeric columns are compared with a small tolerance so
+# floating-point noise from different platforms/BLAS libraries doesn't
+# produce false alarms; everything else is compared as exact text.
+# Compares an ARDS-style CSV against the server version and returns EVERY
+# differing cell as its own row (row/column/local/server), rather than
+# stopping at the first difference -- so a downloadable report can itemize
+# every place two files disagree, not just the first one found. When there's
+# nothing to itemize (files match, one is missing, structure differs, or the
+# comparison itself failed), returns a single row with row/column left NA
+# and the reason in `status`.
+compare_ards_to_server_detail <- function(local_csv, server_csv,
+                                          ignore_cols = c("PROGRAM", "OUTPUT"), tol = 1e-6) {
+  no_diff_row <- function(status) {
+    data.frame(row = NA_integer_, column = NA_character_,
+               local_value = NA_character_, server_value = NA_character_,
+               status = status, stringsAsFactors = FALSE)
+  }
+  
+  if (!file.exists(local_csv)) return(no_diff_row("LOCAL_MISSING"))
+  if (!file.exists(server_csv)) return(no_diff_row("SERVER_MISSING"))
+  
+  # Everything below is wrapped in one tryCatch -- real-world CSVs can have
+  # blank/duplicate column headers (e.g. a trailing comma), unexpected
+  # types, or other quirks that would otherwise throw an uncaught error and
+  # take down the whole comparison (and the reactive session with it, per
+  # the on.exit() lesson learned earlier). Any such failure now reports
+  # cleanly as COMPARE_FAILED instead.
+  tryCatch({
+    local_df <- read.csv(local_csv, stringsAsFactors = FALSE, check.names = FALSE)
+    server_df <- read.csv(server_csv, stringsAsFactors = FALSE, check.names = FALSE)
+    
+    # Blank or duplicate headers (a trailing comma, a hand-edited CSV, etc.)
+    # would otherwise make column selection by name ambiguous or throw
+    # "undefined columns selected" -- give every column a distinct, valid
+    # name before comparing.
+    fix_names <- function(nms) {
+      nms <- trimws(nms)
+      nms[!nzchar(nms)] <- "V"
+      make.unique(nms)
+    }
+    names(local_df) <- fix_names(names(local_df))
+    names(server_df) <- fix_names(names(server_df))
+    
+    drop_ignored <- function(df) {
+      keep <- !(toupper(names(df)) %in% toupper(ignore_cols))
+      df[, keep, drop = FALSE]
+    }
+    local_df <- drop_ignored(local_df)
+    server_df <- drop_ignored(server_df)
+    
+    if (ncol(local_df) != ncol(server_df) ||
+        !identical(sort(names(local_df)), sort(names(server_df)))) {
+      return(no_diff_row(sprintf("DIFFERENT (columns differ: local has %d, server has %d)",
+                                 ncol(local_df), ncol(server_df))))
+    }
+    server_df <- server_df[, names(local_df), drop = FALSE]
+    
+    if (nrow(local_df) != nrow(server_df)) {
+      return(no_diff_row(sprintf("DIFFERENT (row count: local=%d, server=%d)", nrow(local_df), nrow(server_df))))
+    }
+    if (nrow(local_df) == 0) return(no_diff_row("MATCH"))
+    
+    # Check the RESULT column first -- that's the actual computed value and
+    # the signal that actually matters -- but still collect every OTHER
+    # column's differences too, not just RESULT's.
+    col_order <- names(local_df)
+    is_result <- toupper(trimws(col_order)) == "RESULT"
+    col_order <- c(col_order[is_result], col_order[!is_result])
+    
+    all_diffs <- list()
+    for (col in col_order) {
+      lv <- local_df[[col]]
+      sv <- server_df[[col]]
+      lnum <- suppressWarnings(as.numeric(lv))
+      snum <- suppressWarnings(as.numeric(sv))
+      numeric_col <- !any(is.na(lnum) != is.na(lv)) && !any(is.na(snum) != is.na(sv))
+      if (numeric_col) {
+        diffs <- which(!( (is.na(lnum) & is.na(snum)) | (abs(lnum - snum) <= tol) ))
+      } else {
+        # Neutralize embedded absolute paths before comparing text columns
+        # -- footnote-style columns (e.g. "FOOTNOTE4: Program Location:
+        # C:/...") legitimately differ between local and server just
+        # because of where each one was run from, same as the docx/rtf
+        # comparison already handles. Not restricted to specific column
+        # names, since which column holds this text varies by program.
+        lchar <- normalize_paths_for_compare(trimws(as.character(lv)))
+        schar <- normalize_paths_for_compare(trimws(as.character(sv)))
+        diffs <- which(lchar != schar)
+      }
+      if (length(diffs) > 0) {
+        all_diffs[[col]] <- data.frame(
+          row = diffs, column = col,
+          local_value = as.character(lv[diffs]),
+          server_value = as.character(sv[diffs]),
+          status = "DIFFERENT",
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+    
+    if (length(all_diffs) == 0) return(no_diff_row("MATCH"))
+    out <- do.call(rbind, all_diffs)
+    out[order(out$row), ]
+  }, error = function(e) {
+    no_diff_row(paste0("COMPARE_FAILED (", conditionMessage(e), ")"))
+  })
+}
+
+# Thin wrapper around compare_ards_to_server_detail() for the on-screen
+# summary table -- one line per program, showing just the first difference
+# (RESULT column prioritized). The full itemized list is what the
+# downloadable report uses instead of this summary.
+compare_ards_to_server <- function(local_csv, server_csv,
+                                   ignore_cols = c("PROGRAM", "OUTPUT"), tol = 1e-6) {
+  d <- compare_ards_to_server_detail(local_csv, server_csv, ignore_cols, tol)
+  if (nrow(d) == 1 && is.na(d$row[1])) return(d$status[1])
+  i <- 1
+  sprintf("DIFFERENT (row %d, col '%s': local='%s' vs server='%s')",
+          d$row[i], d$column[i], d$local_value[i], d$server_value[i])
 }
 
 log_line <- function(msg) {
@@ -418,6 +684,255 @@ build_launch_args <- function(program_path, use_clean_lib, clean_lib_dir) {
 }
 
 # ---------------------------------------------------------------------------
+# Package bootstrap (for the CLEAN-library run and the Windows run script)
+#
+# The user is never asked where packages come from:
+#   * Company-internal packages (e.g. HPC.R.Utilities_*.tar.gz,
+#     TRIALImpute_*.tar.gz) are already shipped inside the submission's
+#     programs/ folder -> installed straight from those local files.
+#   * Public packages -> pulled from the repo this R session is already
+#     configured with (Artifactory-backed per company policy). If the session
+#     has none configured, fall back to the constant below.
+# ---------------------------------------------------------------------------
+
+# TODO(owner): fill in the real Artifactory CRAN remote repo URL (see the
+# Artifactory | Developer Platform Front Door page). Only used as a fallback.
+LILLY_REPOS_FALLBACK <- c(CRAN = "https://elilillyco.jfrog.io/artifactory/api/cran/<CRAN-REMOTE-REPO-NAME>")
+
+get_package_repos <- function() {
+  r <- getOption("repos")
+  if (is.null(r) || length(r) == 0 || any(r %in% c("@CRAN@", ""))) LILLY_REPOS_FALLBACK else r
+}
+
+# Self-contained on purpose: it is deparse()d into a standalone Rscript (Linux
+# clean-lib run) and into the Windows wrapper, so it must not call any other
+# function defined in this app.
+bootstrap_packages <- function(programs_dir, lib, repos, scan_files, use_pins = TRUE) {
+  dir.create(lib, recursive = TRUE, showWarnings = FALSE)
+  .libPaths(c(lib, .libPaths()))
+  options(repos = repos)
+  
+  # An install that was interrupted (window closed, paused, network drop) leaves
+  # a 00LOCK folder and half-unpacked temp folders behind. A leftover 00LOCK makes
+  # EVERY later install.packages() into this library fail, so the packages stay
+  # missing and the programs die with "there is no package called ...".
+  # This process is the only one touching the library, so it is safe to clear them.
+  subdirs <- list.dirs(lib, recursive = FALSE, full.names = TRUE)
+  stale <- subdirs[grepl("^00LOCK", basename(subdirs)) | !file.exists(file.path(subdirs, "DESCRIPTION"))]
+  if (length(stale) > 0) {
+    cat("[bootstrap] removing leftovers of an interrupted install:", paste(basename(stale), collapse = ", "), "\n")
+    unlink(stale, recursive = TRUE, force = TRUE)
+  }
+  
+  have <- function() rownames(installed.packages(lib.loc = .libPaths()))
+  builtin <- rownames(installed.packages(priority = c("base", "recommended")))
+  nrm <- function(p) normalizePath(p, winslash = "/", mustWork = FALSE)
+  
+  # Scan ONLY the programs being run, plus any .R file they source() (e.g.
+  # setup.R / autoexec.R / helpers.R) -- followed transitively. Every other
+  # file in the folder is ignored, so unrelated programs/apps in the same
+  # folder don't pull in packages this run doesn't need.
+  all_r <- nrm(list.files(programs_dir, pattern = "\\.[Rr]$", recursive = TRUE, full.names = TRUE))
+  all_r <- all_r[!grepl("(^|/)renv/", all_r)]
+  # env.R is always scanned: the run script executes it for every program, and
+  # it lists packages as quoted strings (library_loader(c("dplyr", ...))).
+  env_r <- file.path(programs_dir, "env.R")
+  queue <- unique(nrm(c(scan_files, if (file.exists(env_r)) env_r)))
+  files <- character(0)
+  followed <- character(0)
+  used <- character(0)
+  used_in <- character(0)
+  while (length(queue) > 0) {
+    f <- queue[1]; queue <- queue[-1]
+    if (f %in% files) next
+    files <- c(files, f)
+    txt <- tryCatch(readLines(f, warn = FALSE), error = function(e) character(0))
+    txt <- sub("#.*$", "", txt)
+    lit <- txt[!grepl("character.only", txt, fixed = TRUE)]
+    m_a <- unlist(regmatches(lit, gregexpr("(library|require)\\(\\s*[\"']?[A-Za-z][A-Za-z0-9.]*", lit)))
+    m_b <- unlist(regmatches(txt, gregexpr("(requireNamespace|loadNamespace)\\(\\s*[\"'][A-Za-z][A-Za-z0-9.]*", txt)))
+    m <- c(m_a, m_b)
+    m2 <- unlist(regmatches(txt, gregexpr("[A-Za-z][A-Za-z0-9.]*:::?[A-Za-z_.]", txt)))
+    # Packages given as a quoted vector, e.g. library_loader(c("dplyr", "tidyr"))
+    flat <- paste(txt, collapse = "\n")
+    lm <- unlist(regmatches(flat, gregexpr("library_loader\\(\\s*c\\([^)]*\\)", flat)))
+    m3 <- gsub("[\"']", "", unlist(regmatches(lm, gregexpr("[\"'][A-Za-z][A-Za-z0-9.]*[\"']", lm))))
+    pk <- c(sub(".*\\(\\s*[\"']?", "", m), sub(":::?.*$", "", m2), m3)
+    used <- c(used, pk)
+    used_in <- c(used_in, rep(basename(f), length(pk)))
+    src_lines <- grep("source\\(", txt, value = TRUE)
+    lits <- unlist(regmatches(src_lines, gregexpr("[\"'][^\"']*\\.[Rr][\"']", src_lines)))
+    for (n in unique(basename(gsub("[\"']", "", lits)))) {
+      hit <- all_r[tolower(basename(all_r)) == tolower(n)]
+      new <- setdiff(hit, c(files, queue))
+      if (length(new) > 0) {
+        queue <- c(queue, new)
+        followed <- c(followed, paste(basename(f), "->", n))
+      }
+    }
+  }
+  used <- used[nzchar(used)]
+  
+  # Company packages shipped next to the programs: only the ones actually used
+  local_files <- list.files(programs_dir, pattern = "_.*\\.tar\\.gz$", full.names = TRUE)
+  local_names <- sub("_.*$", "", basename(local_files))
+  keep <- local_names %in% used
+  skipped_local <- local_names[!keep]
+  local_files <- local_files[keep]
+  local_names <- local_names[keep]
+  local_deps <- character(0)
+  for (i in seq_along(local_files)) {
+    tmp <- tempfile(); dir.create(tmp)
+    tryCatch(suppressWarnings(untar(local_files[i], files = paste0(local_names[i], "/DESCRIPTION"), exdir = tmp)),
+             error = function(e) NULL)
+    d <- file.path(tmp, local_names[i], "DESCRIPTION")
+    if (file.exists(d)) {
+      dc <- read.dcf(d, fields = c("Depends", "Imports", "LinkingTo"))
+      x <- unlist(strsplit(paste(na.omit(as.vector(dc)), collapse = ","), ","))
+      x <- trimws(gsub("\\(.*$", "", gsub("\\s+", " ", x)))
+      local_deps <- c(local_deps, x[nzchar(x) & x != "R"])
+    }
+  }
+  
+  # Company packages shipped as .zip (e.g. dataCompareR.zip): either an
+  # already-built Windows package or a source folder -- handled both ways.
+  zip_files <- list.files(programs_dir, pattern = "\\.zip$", full.names = TRUE)
+  zip_names <- sub("(_[0-9][^/]*)?\\.zip$", "", basename(zip_files))
+  zkeep <- zip_names %in% used
+  zip_files <- zip_files[zkeep]
+  zip_names <- zip_names[zkeep]
+  zip_dirs <- rep(NA_character_, length(zip_files))
+  for (i in seq_along(zip_files)) {
+    tmp <- tempfile(); dir.create(tmp)
+    tryCatch(unzip(zip_files[i], exdir = tmp), error = function(e) NULL)
+    cand <- c(tmp, list.dirs(tmp, recursive = FALSE, full.names = TRUE))
+    cand <- cand[file.exists(file.path(cand, "DESCRIPTION"))]
+    if (length(cand) > 0) {
+      zip_dirs[i] <- cand[1]
+      dc <- read.dcf(file.path(cand[1], "DESCRIPTION"), fields = c("Depends", "Imports", "LinkingTo"))
+      x <- unlist(strsplit(paste(na.omit(as.vector(dc)), collapse = ","), ","))
+      x <- trimws(gsub("\\(.*$", "", gsub("\\s+", " ", x)))
+      local_deps <- c(local_deps, x[nzchar(x) & x != "R"])
+    }
+  }
+  local_names <- c(local_names, zip_names)
+  
+  need <- setdiff(unique(c(used, local_deps)), c(builtin, local_names, have(), "package"))
+  cat(sprintf("[bootstrap] scanned %d file(s): %s\n", length(files), paste(basename(files), collapse = ", ")))
+  if (length(followed) > 0) cat("[bootstrap] followed source() calls:", paste(followed, collapse = "; "), "\n")
+  cat(sprintf("[bootstrap] %d public package(s) needed directly; company package(s) used: %s%s\n",
+              length(need), if (length(local_names)) paste(local_names, collapse = ", ") else "none",
+              if (length(skipped_local)) paste0(" (not used, skipped: ", paste(skipped_local, collapse = ", "), ")") else ""))
+  for (p in need) {
+    src <- unique(used_in[used == p])
+    cat(sprintf("[bootstrap]   %s <- %s\n", p,
+                if (length(src)) paste(utils::head(src, 3), collapse = ", ") else "dependency of a company package"))
+  }
+  
+  if (length(need) > 0) {
+    tryCatch(install.packages(need, lib = lib, repos = repos,
+                              dependencies = c("Depends", "Imports", "LinkingTo")),
+             error = function(e) cat("[bootstrap] public install error:", conditionMessage(e), "\n"))
+  }
+  for (i in seq_along(local_files)) {
+    if (!(local_names[i] %in% have())) {
+      cat("[bootstrap] installing company package from local file:", basename(local_files[i]), "\n")
+      tryCatch(install.packages(local_files[i], lib = lib, repos = NULL, type = "source"),
+               error = function(e) cat("[bootstrap] failed:", basename(local_files[i]), "-", conditionMessage(e), "\n"))
+    }
+  }
+  
+  for (i in seq_along(zip_files)) {
+    if (zip_names[i] %in% have()) next
+    d <- zip_dirs[i]
+    if (is.na(d)) {
+      cat("[bootstrap] could not find a package inside", basename(zip_files[i]), "\n")
+      next
+    }
+    cat("[bootstrap] installing company package from local file:", basename(zip_files[i]), "\n")
+    tryCatch({
+      if (dir.exists(file.path(d, "Meta"))) {
+        target <- file.path(lib, zip_names[i])
+        dir.create(target, showWarnings = FALSE)
+        file.copy(list.files(d, full.names = TRUE, all.files = TRUE, no.. = TRUE), target, recursive = TRUE)
+      } else {
+        install.packages(d, lib = lib, repos = NULL, type = "source")
+      }
+    }, error = function(e) cat("[bootstrap] failed:", basename(zip_files[i]), "-", conditionMessage(e), "\n"))
+  }
+  
+  # Match the versions pinned in setup.R (the submission's own record of the
+  # validated package versions), for packages the programs use. Only pure-R
+  # packages (NeedsCompilation: no) are swapped, since older compiled packages
+  # would need a compiler toolchain; those keep the version just installed.
+  setup_r <- file.path(programs_dir, "setup.R")
+  if (isTRUE(use_pins) && file.exists(setup_r)) {
+    sl <- readLines(setup_r, warn = FALSE)
+    mm <- regmatches(sl, regexec('^\\s*([A-Za-z][A-Za-z0-9.]*)\\s*=\\s*"([0-9][^"]*)"\\s*,?\\s*$', sl))
+    mm <- mm[lengths(mm) == 3]
+    pins <- setNames(vapply(mm, function(z) z[3], ""), vapply(mm, function(z) z[2], ""))
+    snap <- sub('^.*CRAN_URL\\s*<-\\s*"[^"]*/cran/([0-9-]+)".*$', "\\1",
+                grep("CRAN_URL\\s*<-", sl, value = TRUE)[1])
+    targets <- setdiff(intersect(names(pins), c(used, local_deps)), c(builtin, local_names))
+    cat(sprintf("[bootstrap] setup.R pins %d package version(s); checking the %d used by these programs\n",
+                length(pins), length(targets)))
+    base1 <- unname(repos[1])
+    bases <- unique(c(base1, sub("/latest$", paste0("/", snap), base1),
+                      sub("__linux__/[^/]+/", "", base1),
+                      sub("__linux__/[^/]+/", "", sub("/latest$", paste0("/", snap), base1))))
+    for (p in targets) {
+      ver <- pins[[p]]
+      cur <- tryCatch(as.character(packageVersion(p, lib.loc = .libPaths())), error = function(e) NA_character_)
+      if (!is.na(cur) && package_version(cur) == package_version(ver)) next
+      tarball <- file.path(tempdir(), sprintf("%s_%s.tar.gz", p, ver))
+      got <- FALSE
+      for (b in bases) {
+        for (u in c(sprintf("%s/src/contrib/Archive/%s/%s_%s.tar.gz", b, p, p, ver),
+                    sprintf("%s/src/contrib/%s_%s.tar.gz", b, p, ver))) {
+          got <- tryCatch(suppressWarnings(download.file(u, tarball, mode = "wb", quiet = TRUE)) == 0,
+                          error = function(e) FALSE)
+          if (got) break
+        }
+        if (got) break
+      }
+      if (!got) {
+        cat(sprintf("[bootstrap]   %s: pinned %s not downloadable, kept %s\n", p, ver, cur))
+        next
+      }
+      tmp <- tempfile(); dir.create(tmp)
+      tryCatch(suppressWarnings(untar(tarball, files = paste0(p, "/DESCRIPTION"), exdir = tmp)), error = function(e) NULL)
+      dd <- file.path(tmp, p, "DESCRIPTION")
+      nc <- if (file.exists(dd)) read.dcf(dd, fields = "NeedsCompilation")[1, 1] else NA
+      if (isTRUE(tolower(nc) == "yes")) {
+        cat(sprintf("[bootstrap]   %s: pinned %s needs compiling, kept %s\n", p, ver, cur))
+        next
+      }
+      tryCatch({
+        install.packages(tarball, lib = lib, repos = NULL, type = "source")
+        cat(sprintf("[bootstrap]   %s: %s -> pinned %s\n", p, cur, ver))
+      }, error = function(e) cat(sprintf("[bootstrap]   %s: pin to %s failed (%s)\n", p, ver, conditionMessage(e))))
+    }
+  }
+  
+  still_missing <- setdiff(c(need, local_names), have())
+  if (length(still_missing) > 0) {
+    cat("[bootstrap] STILL MISSING:", paste(still_missing, collapse = ", "), "\n")
+  } else {
+    cat("[bootstrap] all packages available.\n")
+  }
+  invisible(still_missing)
+}
+
+# Lines of a standalone R script that defines + runs bootstrap_packages().
+# lib_expr / dir are R code / path strings already valid for the target machine.
+bootstrap_script_lines <- function(programs_dir, lib_expr, repos, scan_files, use_pins = TRUE) {
+  c(paste0("bootstrap_packages <- ", paste(deparse(bootstrap_packages, width.cutoff = 500L), collapse = "\n")),
+    sprintf("bootstrap_packages(%s, %s, %s, %s, %s)", deparse(programs_dir), lib_expr,
+            paste(deparse(repos), collapse = ""), paste(deparse(scan_files), collapse = ""),
+            deparse(isTRUE(use_pins))))
+}
+
+# ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 
@@ -430,13 +945,17 @@ app_theme <- bslib::bs_theme(
   danger = "#dc2626",
   bg = "#f8fafc",
   fg = "#0f172a",
+  base_font = bslib::font_collection(
+    "-apple-system", "BlinkMacSystemFont", "Segoe UI", "Roboto", "Helvetica Neue", "Arial", "sans-serif"
+  ),
+  "font-size-base" = "0.85rem",
   "border-radius" = "0.5rem",
   "card-border-color" = "#e2e8f0",
   "navbar-bg" = "#1d4ed8"
 )
 
 ui <- bslib::page_sidebar(
-  title = "Submission File Local Test Runner",
+  title = "SAFE: Submission Assessment For Executables",
   theme = app_theme,
   useShinyjs(),
   
@@ -459,6 +978,18 @@ ui <- bslib::page_sidebar(
     ".card-body { overflow-y: auto !important; }",
     ".card-body.html-fill-container > .html-fill-item { flex: 0 0 auto !important; height: auto !important; }"
   ))),
+  tags$style(HTML(paste0(
+    "/* bslib's own '.bslib-gap-spacing' mechanism already zeroes each ",
+    "child's own margin-bottom and uses ONE 'gap' value between siblings ",
+    "instead -- so the actual fix is turning that gap down (default is a ",
+    "generous 1.5rem), not re-adding per-element margins, which would only ",
+    "stack on top of the gap and make spacing worse, not better. */",
+    ".bslib-gap-spacing { gap: 0.4rem !important; }",
+    "h6 { margin-top: 0.6rem; margin-bottom: 0.3rem; font-weight: 600; }",
+    "hr { margin: 0.6rem 0 !important; }",
+    ".card-header { font-weight: 600; padding-top: 0.6rem; padding-bottom: 0.6rem; }",
+    ".help-block { line-height: 1.35 !important; }"
+  ))),
   
   sidebar = bslib::sidebar(
     width = 400,
@@ -472,12 +1003,12 @@ ui <- bslib::page_sidebar(
                            "font-size:1.05rem; width:40px; height:40px; ",
                            "border-radius:8px; display:flex; align-items:center; ",
                            "justify-content:center; flex-shrink:0;"),
-            "SF"),
+            "S"),
         div(
           div(style = "font-weight:700; font-size:0.98rem; line-height:1.25; color:#0f1f3d;",
-              "Submission Test Runner"),
+              "SAFE"),
           div(style = "font-size:0.74rem; color:#334155;",
-              "Local FDA-environment validation")
+              "Submission Assessment For Executables")
         )
       ),
       tags$div(style = paste0("font-size:0.66rem; letter-spacing:0.06em; ",
@@ -485,8 +1016,8 @@ ui <- bslib::page_sidebar(
                               "margin-bottom:4px;"),
                "About"),
       p(style = "font-size:0.78rem; color:#1e293b; line-height:1.4; margin-bottom:0;",
-        "A local testing tool that validates submission executable programs ",
-        "before FDA review.")
+        "Emulates the FDA reviewer's local machine to test submission ",
+        "executable programs before review.")
     ),
     
     tags$div(style = paste0("font-size:0.68rem; letter-spacing:0.06em; ",
@@ -494,7 +1025,7 @@ ui <- bslib::page_sidebar(
                             "margin-bottom:6px;"),
              "Setup"),
     
-    h6("1. Copy FROM (real, current location)"),
+    h6("1. Submission Program Folder"),
     textInput("copy_from_path", NULL,
               value = if (IS_WINDOWS) {
                 "Z:/qa/ly3437943/j1i_mc_gzbk/common/documentation/submission/submission_files/j1i_mc_gzbk/final"
@@ -512,25 +1043,45 @@ ui <- bslib::page_sidebar(
     verbatimTextOutput("hardcoded_path_breakdown"),
     helpText("Pulled from the segment right after the compound code (ly######) in the path above."),
     
-    h6("4. Destination drive/root (auto-detected)"),
-    verbatimTextOutput("dest_full_preview"),
-    helpText(if (IS_WINDOWS) {
-      "Your Windows profile's home drive."
-    } else {
-      "Your home directory (verified to map to the same storage as the Windows drive)."
-    }),
+    h6("4. Server output folder"),
+    textInput("server_output_path", NULL,
+              value = "/lillyce/qa/ly3437943/j1i_mc_gzbk/final/output/shared"),
+    helpText("Compares each program's local .rtf/.docx output against the same-named file here."),
     
     bslib::accordion(
       open = FALSE,
       bslib::accordion_panel(
         "Advanced settings",
         h6("R engine"),
-        textInput("rscript_path", "Rscript path", value = DEFAULT_RSCRIPT_PATH),
-        helpText("Defaults to the R engine running this app. Override only to test a different R installation."),
+        radioButtons("r_engine_mode", NULL,
+                     choices = c("Server R engine (Linux, default)" = "default",
+                                 "Local R engine (Windows)" = "custom"),
+                     selected = "default"),
+        conditionalPanel(
+          condition = "input.r_engine_mode == 'custom'",
+          div(style = paste0("background:#fff3cd; border:1px solid #ffe69c; ",
+                             "border-radius:6px; padding:8px 12px; margin-bottom:8px; font-size:0.8rem; color:#664d03;"),
+              tags$strong("R must already be installed locally "),
+              "for this to work -- this only points at an existing install; it doesn't install R for you. ",
+              "This session can't launch a Windows program directly either, so 'Run selected programs' will ",
+              "instead generate a .R script for you to run with one typed command on the Windows side. ",
+              "It may also adjust files in the shared 'programs' folder to work on Windows -- re-run ",
+              "'Set up testing environment' before switching back to the Linux engine."),
+          textInput("rscript_path", "Rscript path", value = "Y:/Programs/R/R-4.6.1/bin/Rscript.exe"),
+          helpText("Packages for this run install into <drive>:\\", WIN_LIB_DIRNAME, " (drive taken from the Rscript path), ",
+                   "so nothing goes to C: or the R install folder. 'Reset clean library' below deletes it.")
+        ),
+        helpText("Use your own local R install (e.g. on your Citrix Y: drive) instead of the server R engine. ",
+                 "Point at the Rscript.exe inside that install's bin/ folder, not RStudio.exe."),
         checkboxInput("clean_library", "Run with a CLEAN package library (exclude pre-installed extension packages)",
                       value = TRUE),
         helpText("Forces each program to install its own packages instead of using pre-installed ones. ",
                  "Persists within one Run, resets on the next -- still not a substitute for the Windows/Citrix toolchain."),
+        checkboxInput("use_pinned_versions", "Use the package versions pinned in setup.R where possible (slower)", value = FALSE),
+        helpText("Matches the validated versions listed in the submission's setup.R (e.g. officer, flextable) for ",
+                 "packages these programs use. Only pure-R packages are swapped; compiled ones keep the current version. ",
+                 "Off by default: packages are only checked for being installed, not for version. ",
+                 "Takes effect when the library is (re)built -- use 'Reset clean library' to start over."),
         actionButton("reset_clean_lib", "Reset clean library", style = "width: auto;"),
         hr(),
         h6("LOA column names (override if your file's headers differ)"),
@@ -543,75 +1094,36 @@ ui <- bslib::page_sidebar(
         h6("Path replacement"),
         textInput("file_extensions", "File extensions to scan/replace", value = "R"),
         checkboxInput("ignore_case", "Ignore case when matching path", value = FALSE),
-        checkboxInput("keep_backup", "Keep an untouched backup before replacing", value = FALSE)
+        checkboxInput("keep_backup", "Keep an untouched backup before replacing", value = FALSE),
+        checkboxInput("force_recopy", "Always re-copy files, even if already set up", value = FALSE)
       )
-    ),
-    
-    hr(style = "margin: 16px 0 10px;"),
-    tags$div(style = paste0("font-size:0.68rem; letter-spacing:0.06em; ",
-                            "color:#64748b; text-transform:uppercase; ",
-                            "margin-bottom:6px;"),
-             "Help"),
-    p(style = "font-size:0.78rem; color:#334155; line-height:1.4;",
-      "If a step fails, check the Console Log card first -- every action is ",
-      "timestamped there. Ask in your team's validation channel for anything ",
-      "this app doesn't explain.")
+    )
   ),
   
-  if (IS_WINDOWS) {
-    div(class = "alert alert-success", role = "alert",
-        strong("Running on Windows. "),
-        "Full environment test -- Copy, Path Replace, Run, and Output Check all ",
-        "reflect real Windows/Citrix behavior (including package installation ",
-        "and compilation).")
-  } else {
-    div(class = "alert alert-warning", role = "alert",
-        strong("Running on Linux (Posit Workbench). "),
-        "This is a LOGIC-ONLY pre-check. It runs the programs end-to-end and can ",
-        "catch code bugs, but it does NOT validate package installation, Rtools ",
-        "compilation, or any Windows-specific behavior. A pass here is a useful ",
-        "early signal, but is not sufficient evidence -- you still need to run ",
-        "the full test on the Windows/Citrix machine afterward. (The destination ",
-        "path below will literally create a folder named e.g. 'Y:' here, since ",
-        "Linux filenames can contain a colon -- this lets the hardcoded ",
-        "Windows-style paths in the programs resolve for this logic check.)")
-  },
-  
   bslib::layout_columns(
-    col_widths = c(4, 4, 4),
+    col_widths = c(6, 6),
     
     bslib::card(
       full_screen = TRUE,
       height = "780px",
-      bslib::card_header("1. Copy & Prepare for Testing"),
-      div(style = "display: flex; flex-direction: row; flex-wrap: wrap; gap: 8px;",
-          actionButton("copy_btn", "Copy server folder to Citrix drive", class = "btn-primary btn-sm", style = "width: auto;"),
-          actionButton("prepare_btn", "Prepare files for testing", class = "btn-primary btn-sm", style = "width: auto;")
-      ),
-      helpText("Progress and results appear in the Console Log tab."),
-      hr(),
-      h6("Files found:"),
-      DTOutput("scan_table")
-    ),
-    
-    bslib::card(
-      full_screen = TRUE,
-      height = "780px",
-      bslib::card_header("2. Run Programs"),
+      bslib::card_header("1. Set Up Testing Environment & Run Programs"),
       div(style = "display: flex; flex-direction: row; align-items: center; flex-wrap: wrap; gap: 8px 16px;",
+          actionButton("setup_env_btn", "Set up testing environment", class = "btn-primary btn-sm", style = "width: auto;"),
           actionButton("refresh_programs_btn", "Refresh program list based on LOA", class = "btn-primary btn-sm", style = "width: auto;"),
           div(style = "white-space: nowrap;", checkboxInput("recurse_subfolders", "Include subfolders", value = FALSE))
       ),
-      br(),
+      helpText("Finds which programs are ready to test, based on your LOA file."),
       h6(textOutput("programs_select_heading", inline = TRUE)),
+      div(style = "display: flex; flex-direction: row; gap: 8px; margin-bottom: 4px;",
+          actionButton("select_all_btn", "Select all", class = "btn-outline-primary btn-sm", style = "width: auto;"),
+          actionButton("deselect_all_btn", "Deselect all", class = "btn-outline-secondary btn-sm", style = "width: auto;")
+      ),
       DTOutput("programs_table"),
       uiOutput("loa_unmatched_box"),
-      br(),
       div(style = "display: flex; flex-direction: row; flex-wrap: wrap; gap: 8px;",
           actionButton("run_btn", "Run selected programs", class = "btn-primary btn-sm", style = "width: auto;"),
           actionButton("stop_btn", "Stop", class = "btn-danger btn-sm", style = "width: auto;")
       ),
-      br(),
       h6("Run status:"),
       DTOutput("run_status_table")
     ),
@@ -619,21 +1131,32 @@ ui <- bslib::page_sidebar(
     bslib::card(
       full_screen = TRUE,
       height = "780px",
-      bslib::card_header("3. Output & Log"),
+      bslib::card_header("2. Output & Log"),
       h6("Output Check"),
       div(style = "display: flex; flex-direction: row; flex-wrap: wrap; gap: 8px;",
           actionButton("check_btn", "Check output completeness", class = "btn-primary btn-sm", style = "width: auto;"),
           downloadButton("save_report_btn", "Download report (CSV)", class = "btn-sm", style = "width: auto;")
       ),
-      br(),
       DTOutput("completeness_table"),
+      
+      hr(),
+      h6("Output Comparison"),
+      div(style = "display: flex; flex-direction: row; flex-wrap: wrap; gap: 8px;",
+          actionButton("compare_ards_btn", "Compare output to server", class = "btn-primary btn-sm", style = "width: auto;"),
+          downloadButton("save_ards_report_btn", "Download report (CSV)", class = "btn-sm", style = "width: auto;")
+      ),
+      helpText("Compares each LOA-required program's output from Step 1's folder against the server version."),
+      DTOutput("ards_compare_table"),
+      
+      hr(),
+      actionButton("clear_cache_btn", "Clear testing environment", class = "btn-danger btn-sm", style = "width: auto;"),
+      helpText("Deletes the local test copy so the next setup starts fresh."),
       
       hr(),
       div(style = "display: flex; flex-direction: row; justify-content: space-between; align-items: center;",
           h6("Console Log", style = "margin-bottom: 0;"),
           actionButton("clear_log_btn", "Clear log", class = "btn-sm", style = "width: auto;")
       ),
-      br(),
       tags$style(HTML("#full_log { height: 340px; overflow-y: auto; }")),
       verbatimTextOutput("full_log")
     )
@@ -662,7 +1185,12 @@ server <- function(input, output, session) {
     run_results = list(),
     run_active = FALSE,
     clean_lib_dir = NULL,
-    completeness_result = NULL
+    bootstrap_proc = NULL,
+    bootstrap_log = NULL,
+    completeness_result = NULL,
+    ards_compare_result = NULL,
+    ards_compare_detail = NULL,
+    auto_chain_pending = FALSE
   )
   
   add_log <- function(msg) {
@@ -701,35 +1229,47 @@ server <- function(input, output, session) {
     file.path(normalize_prefix(DEFAULT_DEST_ROOT), extract_relative_structure(hardcoded_path()))
   })
   
-  output$hardcoded_path_breakdown <- renderText({
-    sprintf("Full hardcoded path: %s\nDrive to replace: %s  |  Structure to mirror: %s",
-            hardcoded_path(),
-            extract_drive_prefix(hardcoded_path()),
-            extract_relative_structure(hardcoded_path()))
+  # Which R engine actually runs the programs: this app's own (whatever R
+  # process is hosting the app itself -- e.g. the Linux Posit Workbench
+  # engine, even when accessed through a Windows/Citrix browser), or a
+  # specific alternate install the person points at (e.g. one they've
+  # installed locally on their Citrix Y: drive), to test against a
+  # genuinely different R engine/package setup.
+  effective_rscript_path <- reactive({
+    if (identical(input$r_engine_mode, "custom")) input$rscript_path else DEFAULT_RSCRIPT_PATH
   })
   
-  output$dest_full_preview <- renderText({
-    paste0("Full test path: ", effective_dest_root())
+  observeEvent(input$clear_cache_btn, {
+    dst <- effective_dest_root()
+    if (dir.exists(dst)) {
+      unlink(dst, recursive = TRUE)
+      add_log("Testing environment cleared.")
+      showNotification("Testing environment cleared.", type = "message")
+    } else {
+      add_log("Nothing to clear -- testing environment doesn't exist.")
+    }
+  })
+  
+  output$hardcoded_path_breakdown <- renderText({
+    sprintf("Detected: %s", protocol_id_reactive())
   })
   
   # -------------------------------------------------------------------------
   # Tab 1: Copy
   # -------------------------------------------------------------------------
   
-  observeEvent(input$copy_btn, {
+  run_copy_step <- function() {
     src <- input$copy_from_path
     dst <- effective_dest_root()
     
     if (!dir.exists(src)) {
       add_log(paste0("ERROR: source path does not exist or is not reachable: ", src))
       showNotification("Source path not found. Check the path and network connectivity.", type = "error")
-      return(invisible(NULL))
+      return(FALSE)
     }
     
     rv$copy_total_files <- length(list.files(src, recursive = TRUE))
-    add_log(sprintf("Starting copy (%s): %s -> %s (%d files found in source; mirroring '%s' under the destination root)",
-                    if (IS_WINDOWS) "robocopy" else "cp", src, dst, rv$copy_total_files,
-                    extract_relative_structure(hardcoded_path())))
+    add_log(sprintf("Setting up files (%d found)...", rv$copy_total_files))
     
     log_path <- file.path(tempdir(), paste0("copy_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".log"))
     rv$copy_log_path <- log_path
@@ -741,7 +1281,8 @@ server <- function(input, output, session) {
       NULL
     })
     rv$copy_proc <- proc
-  })
+    !is.null(proc)
+  }
   
   # Poll the copy process every second while it's running
   copy_timer <- reactiveTimer(1000)
@@ -754,9 +1295,20 @@ server <- function(input, output, session) {
       # Just finished
       exit_code <- proc$get_exit_status()
       status <- if (copy_exit_is_success(exit_code)) "SUCCESS" else "FAILED"
-      add_log(sprintf("Copy finished: %s (exit code %s). Full log: %s",
-                      status, exit_code, rv$copy_log_path))
+      add_log(if (status == "SUCCESS") "Files ready." else sprintf("File setup failed (exit code %s). Check network/path access.", exit_code))
       rv$copy_proc <- NULL
+      
+      # If this copy was kicked off by "Set up testing environment" (Step
+      # 1), silently continue with preparing the files once the copy
+      # finishes -- the person clicked one button for "set up", not two.
+      if (isTRUE(rv$auto_chain_pending)) {
+        rv$auto_chain_pending <- FALSE
+        if (status == "SUCCESS") {
+          run_prepare_step()
+        } else {
+          showNotification("Setup failed -- see Console Log for details.", type = "error")
+        }
+      }
     }
   })
   
@@ -764,16 +1316,16 @@ server <- function(input, output, session) {
   # Tab 2: Path Replace
   # -------------------------------------------------------------------------
   
-  observeEvent(input$prepare_btn, {
+  run_prepare_step <- function() {
     exts <- trimws(strsplit(input$file_extensions, ",")[[1]])
     root <- effective_dest_root()
     files <- list_files_by_ext(root, exts)
-    add_log(sprintf("Scanning %d files under %s for hardcoded path '%s'", length(files), root, hardcoded_path()))
+    add_log(sprintf("Checking %d file(s) for hardcoded path '%s'...", length(files), hardcoded_path()))
     
     if (length(files) == 0) {
       rv$scan_result <- data.frame(file = character(0), fwd_count = integer(0), bwd_count = integer(0), total = integer(0))
       rv$replace_result <- NULL
-      showNotification("No files found to prepare -- copy the folder first.", type = "warning")
+      showNotification("No files found to prepare.", type = "warning")
       return(invisible(NULL))
     }
     
@@ -788,7 +1340,7 @@ server <- function(input, output, session) {
     # ...then apply the replacement, appending n_replaced/status onto it.
     if (input$keep_backup) {
       backup_dir <- paste0(root, "_backup_", format(Sys.time(), "%Y%m%d_%H%M%S"))
-      add_log(paste0("Creating backup copy at: ", backup_dir))
+      add_log("Creating a backup copy before making changes...")
       ok <- tryCatch({
         dir.create(dirname(backup_dir), recursive = TRUE, showWarnings = FALSE)
         file.copy(root, backup_dir, recursive = TRUE)
@@ -800,7 +1352,7 @@ server <- function(input, output, session) {
       }
     }
     
-    add_log(sprintf("Applying replacement '%s' -> '%s' on %d files...", hardcoded_path(), DEFAULT_DEST_ROOT, length(files)))
+    add_log(sprintf("Updating %d file(s) that reference '%s'...", length(files), hardcoded_path()))
     apply_res <- apply_drive_replace(files, pat, DEFAULT_DEST_ROOT, ignore_case = input$ignore_case)
     apply_res$file <- strip_prefix_literal(apply_res$file, root)
     rv$replace_result <- apply_res
@@ -811,19 +1363,8 @@ server <- function(input, output, session) {
     if (n_failed > 0) {
       showNotification(sprintf("%d file(s) could not be read/written -- check the Console Log.", n_failed), type = "warning")
     }
-  })
-  
-  output$scan_table <- renderDT({
-    req(rv$scan_result)
-    df <- rv$scan_result
-    rep_df <- rv$replace_result
-    if (!is.null(rep_df) && nrow(rep_df) > 0) {
-      idx <- match(df$file, rep_df$file)
-      df$n_replaced <- rep_df$n_replaced[idx]
-      df$status <- rep_df$status[idx]
-    }
-    datatable(df, options = list(pageLength = 10), rownames = FALSE)
-  })
+    invisible(NULL)
+  }
   
   # -------------------------------------------------------------------------
   # Tab 3: Run Programs
@@ -834,9 +1375,29 @@ server <- function(input, output, session) {
     files <- list_files_by_ext(dir_path, c("R"), recursive = isTRUE(input$recurse_subfolders))
     rv$programs <- files
     loa_data(NULL)  # a fresh file listing invalidates any prior LOA-derived order/selection
-    add_log(sprintf("Found %d program(s) under %s%s", length(files), dir_path,
-                    if (isTRUE(input$recurse_subfolders)) " (including subfolders)" else " (this folder only)"))
+    add_log(sprintf("Found %d program(s)%s", length(files),
+                    if (isTRUE(input$recurse_subfolders)) " (including subfolders)" else ""))
   }
+  
+  observeEvent(input$setup_env_btn, {
+    # Step 1: copy -> prepare. Skip the copy step entirely if the
+    # destination already has files from a previous run -- copying is
+    # usually the slowest part, and re-copying unchanged files on every
+    # click just wastes time (see "Force re-copy" in Advanced settings).
+    dst_dir <- effective_dest_root()
+    already_present <- !isTRUE(input$force_recopy) && dir.exists(dst_dir) &&
+      length(list.files(dst_dir, recursive = TRUE)) > 0
+    
+    if (already_present) {
+      add_log("Files already set up -- skipping to the next step.")
+      run_prepare_step()
+      return(invisible(NULL))
+    }
+    
+    rv$auto_chain_pending <- TRUE
+    ok <- run_copy_step()
+    if (!ok) rv$auto_chain_pending <- FALSE
+  })
   
   observeEvent(input$refresh_programs_btn, {
     refresh_programs()
@@ -847,14 +1408,28 @@ server <- function(input, output, session) {
   output$programs_table <- renderDT({
     d <- loa_data()
     to_be_run <- if (!is.null(d)) rv$programs %in% d$ordered else rep(FALSE, length(rv$programs))
-    df <- data.frame(
-      program = basename(rv$programs),
-      `To be run` = ifelse(to_be_run, "\u2713", ""),
-      check.names = FALSE, stringsAsFactors = FALSE
-    )
+    df <- data.frame(program = basename(rv$programs), stringsAsFactors = FALSE)
+    # Row highlighting IS "will be run" -- no separate "To be run" column
+    # that could get out of sync with it. LOA matches just set the initial
+    # selection; the person can then freely check/uncheck rows, and
+    # whatever's actually highlighted when they click Run is what runs.
     selected_idx <- if (!is.null(d)) which(to_be_run) else seq_len(nrow(df))
     datatable(df, selection = list(mode = "multiple", selected = selected_idx),
               options = list(pageLength = 15), rownames = FALSE)
+  })
+  
+  programs_proxy <- DT::dataTableProxy("programs_table")
+  
+  # "Select all" respects the table's Search box: it selects the rows currently
+  # shown after filtering (all rows when there is no search text).
+  observeEvent(input$select_all_btn, {
+    rows <- input$programs_table_rows_all
+    if (is.null(rows)) rows <- seq_along(rv$programs)
+    DT::selectRows(programs_proxy, rows)
+  })
+  
+  observeEvent(input$deselect_all_btn, {
+    DT::selectRows(programs_proxy, NULL)
   })
   
   loa_data <- reactiveVal(NULL)
@@ -890,7 +1465,8 @@ server <- function(input, output, session) {
     rest <- rv$programs[!(rv$programs %in% ordered)]
     rv$programs <- c(ordered, rest)
     
-    loa_data(list(ordered = ordered, unmatched = match_res$unmatched_loa_names, n_yy = length(res$programs)))
+    loa_data(list(ordered = ordered, unmatched = match_res$unmatched_loa_names,
+                  n_yy = length(res$programs), all_yy = res$programs))
     
     add_log(sprintf("Matched %d of %d Y/Y program(s) to actual files (%d unmatched).",
                     length(ordered), length(res$programs), length(match_res$unmatched_loa_names)))
@@ -919,39 +1495,240 @@ server <- function(input, output, session) {
   })
   
   observeEvent(input$run_btn, {
-    d <- loa_data()
-    using_loa <- !is.null(d) && length(d$ordered) > 0
-    if (using_loa) {
-      to_run <- d$ordered
-    } else {
-      sel <- input$programs_table_rows_selected
-      if (length(sel) == 0) {
-        showNotification("Select at least one program to run.", type = "warning")
+    # Always run exactly what's currently highlighted in the table --
+    # loading the LOA only sets the INITIAL selection (the LOA Y/Y
+    # matches); after that, whatever the person has manually checked or
+    # unchecked is what actually runs. No special-case bypass that ignores
+    # a manual deselection just because LOA data happens to be loaded.
+    sel <- input$programs_table_rows_selected
+    if (length(sel) == 0) {
+      showNotification("Select at least one program to run.", type = "warning")
+      return(invisible(NULL))
+    }
+    to_run <- rv$programs[sel]
+    
+    if (identical(input$r_engine_mode, "custom")) {
+      # This (Linux) session can't launch a Windows process directly, and
+      # corporate security policy commonly blocks .bat/.cmd/.ps1 files
+      # specifically (even from a trusted-enough network location) while
+      # still trusting the Rscript.exe binary itself. So generate a plain
+      # .R wrapper script instead -- the person runs it with ONE typed
+      # command that invokes the already-trusted Rscript.exe directly on
+      # this file, sidestepping the blocked script types entirely.
+      #
+      # Inside the wrapper, each program is launched as its OWN separate
+      # Rscript.exe process via system2() -- NOT source(). Source()-ing one
+      # script from inside another changes how a top-level (not-in-a-
+      # function) on.exit() behaves in the called script, which is exactly
+      # the bug this app's own build_launch_args() was redesigned to avoid
+      # earlier. Each program needs to stay the literal top-level entry
+      # point of its own process, same as it would running directly.
+      linux_home <- Sys.getenv("HOME")
+      win_rscript <- input$rscript_path
+      # Auto-detect the drive letter from the Rscript path itself (e.g.
+      # "Y:/Programs/..." -> "Y:") instead of asking for it separately --
+      # it's already right there at the start of the path.
+      win_drive <- extract_drive_prefix(win_rscript)
+      if (!grepl("^[A-Za-z]:$", win_drive)) {
+        showNotification("Rscript path should start with a drive letter (e.g. 'Y:/Programs/...') so it can be detected automatically.", type = "error")
         return(invisible(NULL))
       }
-      to_run <- rv$programs[sel]
+      
+      # Some programs (or things they source(), like autoexec.R) can
+      # hardcode an absolute reference to THIS session's own home
+      # directory -- correct for the Linux test run, meaningless on
+      # Windows. Fixed IN PLACE, in the same "programs" folder everything
+      # else already uses -- NOT a separately-named copy. Programs in this
+      # folder can reference each other (e.g. by a path built from their
+      # OWN folder's name), so a differently-named sibling folder risks a
+      # subtler, harder-to-spot path bug than the one this is fixing.
+      # Trade-off: this does mean switching back to the Linux engine
+      # afterward needs "Set up testing environment" run again (ideally
+      # with "Force re-copy" on) to get a clean Linux-appropriate copy.
+      programs_dir <- file.path(effective_dest_root(), PROGRAMS_SUBDIR)
+      all_program_files <- list_files_by_ext(programs_dir, c("R"), recursive = TRUE)
+      home_fix <- apply_linux_home_to_windows_replace(all_program_files, linux_home, win_drive)
+      n_home_fixed <- sum(home_fix$status == "REPLACED", na.rm = TRUE)
+      if (n_home_fixed > 0) {
+        add_log(sprintf(paste0("Adjusted %d file(s) that referenced this session's own path, for the Windows run ",
+                               "(re-run 'Set up testing environment' before switching back to the Linux engine)."),
+                        n_home_fixed))
+      }
+      
+      win_programs <- vapply(to_run, function(p) to_windows_path(p, linux_home, win_drive), character(1))
+      
+      win_programs_dir <- to_windows_path(programs_dir, linux_home, win_drive)
+      
+      # Dedicated package library: packages never land in the person's C:
+      # user library / the R install itself, and the run can't silently reuse
+      # packages installed earlier. Lives at the root of the person's drive
+      # (outside the copied submission folder, so the path-replace step never
+      # touches installed packages).
+      win_lib <- to_windows_path(file.path(normalize_prefix(linux_home), WIN_LIB_DIRNAME), linux_home, win_drive)
+      add_log(sprintf("Windows run will use a dedicated package library: %s", win_lib))
+      lib_env_lines <- c(
+        # Forward slashes on purpose: R reports .libPaths() entries that way, and
+        # the TFL programs compare them to Sys.getenv("R_LIBS_USER") as plain text.
+        paste0("lib_dir <- ", deparse(gsub("\\\\", "/", win_lib))),
+        "Sys.setenv(R_LIBS = lib_dir, R_LIBS_USER = lib_dir,",
+        "           R_LIBS_SITE = lib_dir)",
+        'cat("Package library for this run:", lib_dir, "\\n\\n")'
+      )
+      
+      # Diagnostic hook: if a program dies with an uncaught error, print which
+      # library paths that R process had at that moment (and where dplyr is, if
+      # anywhere). Loaded into every Rscript child via R_PROFILE_USER.
+      diag_profile_lines <- c(
+        "if (nzchar(Sys.getenv('R_DIAG_TRACE'))) {",
+        "invisible(tryCatch(suppressMessages(trace('.libPaths', tracer = quote(if (!missing(new)) { cat('\\n[diag] .libPaths() reset to: ', paste(new, collapse = ' | '), '\\n', sep = ''); cat(paste0('  ', vapply(utils::tail(sys.calls(), 8), function(x) substr(paste(deparse(x), collapse = ' '), 1, 160), '')), sep = '\\n') }), print = FALSE)), error = function(e) NULL))",
+        "options(error = function() {",
+        "  cat('\\n[diag] library paths at the time of the error:\\n')",
+        "  cat(paste0('  ', .libPaths()), sep = '\\n')",
+        "  cat('[diag] R_LIBS = ', Sys.getenv('R_LIBS'), '\\n', sep = '')",
+        "  cat('[diag] working directory = ', getwd(), '\\n', sep = '')",
+        "  cat('[diag] dplyr found at: ', system.file(package = 'dplyr'), '\\n', sep = '')",
+        "  quit(save = 'no', status = 1)",
+        "})",
+        "}"
+      )
+      diag_lines <- c(
+        "diag_profile <- file.path(tempdir(), 'diag_profile.R')",
+        paste0("writeLines(", paste(deparse(diag_profile_lines), collapse = ""), ", diag_profile)"),
+        "Sys.setenv(R_PROFILE_USER = diag_profile)"
+      )
+      
+      # Package preparation runs as its OWN Rscript process (with the same
+      # library environment as the programs), so what it sees and installs is
+      # exactly what each program will see.
+      boot_path <- file.path(effective_dest_root(), "bootstrap_packages.R")
+      writeLines(bootstrap_script_lines(win_programs_dir,
+                                        deparse(win_lib),
+                                        get_package_repos(), win_programs, isTRUE(input$use_pinned_versions)),
+                 boot_path)
+      win_boot_path <- to_windows_path(boot_path, linux_home, win_drive)
+      bootstrap_lines <- c(
+        'cat("=== Preparing packages (company packages from programs folder, public from Artifactory) ===\\n")',
+        paste0("system2(rscript_exe, args = shQuote(", deparse(win_boot_path), "))"),
+        'cat("=== Package preparation done ===\\n\\n")'
+      )
+      add_log("Including package preparation in the Windows run script (company packages come from the programs folder).")
+      
+      # Quick sanity check, in a fresh process with the same environment the
+      # programs get: which library paths does R see, and can it find dplyr?
+      check_lines <- c(
+        'cat("=== Checking what the programs will see ===\\n")',
+        'system2(rscript_exe, args = c("-e", shQuote("cat(\'Library paths:\', .libPaths(), sep = \'\\\\n  \'); cat(\'\\\\ndplyr available:\', requireNamespace(\'dplyr\', quietly = TRUE), \'\\\\n\\\\n\')")))'
+      )
+      
+      # If the project has an env.R with install-if-missing package setup,
+      # run it once too (also as its own process, same library environment).
+      env_r_path <- file.path(programs_dir, "env.R")
+      env_setup_lines <- if (file.exists(env_r_path)) {
+        win_env_r <- to_windows_path(env_r_path, linux_home, win_drive)
+        add_log("Including env.R in the Windows run script to install any missing packages first.")
+        c(
+          'cat("=== Installing/loading required packages (env.R) ===\\n")',
+          paste0("system2(rscript_exe, args = shQuote(", deparse(win_env_r), "))"),
+          'cat("=== Package setup done ===\\n\\n")'
+        )
+      } else {
+        character(0)
+      }
+      
+      wrapper_lines <- c(
+        paste0("rscript_exe <- ", deparse(win_rscript)),
+        "programs <- c(",
+        paste0("  ", vapply(win_programs, deparse, character(1)),
+               c(rep(",", length(win_programs) - 1), "")),
+        ")",
+        lib_env_lines,
+        diag_lines,
+        bootstrap_lines,
+        check_lines,
+        env_setup_lines,
+        "Sys.setenv(R_DIAG_TRACE = '1')",
+        "for (p in programs) {",
+        '  cat("=== Running:", p, "===\\n")',
+        "  status <- system2(rscript_exe, args = shQuote(p))",
+        '  cat("=== Finished (exit code", status, "):", p, "===\\n\\n")',
+        "}",
+        'cat("All programs finished. Press Enter to close this window.\\n")',
+        "invisible(readline())"
+      )
+      wrapper_path <- file.path(effective_dest_root(), "run_selected_programs.R")
+      writeLines(wrapper_lines, wrapper_path)
+      win_wrapper_path <- to_windows_path(wrapper_path, linux_home, win_drive)
+      
+      # Show the Rscript path with backslashes too, so both halves of the
+      # command use the same separator style as the wrapper path above.
+      win_rscript_display <- gsub("/", "\\\\", win_rscript)
+      run_command <- sprintf('"%s" "%s"', win_rscript_display, win_wrapper_path)
+      add_log(sprintf("Generated a Windows run script for %d program(s): %s", length(win_programs), win_wrapper_path))
+      add_log(sprintf("Run it by typing this in a Windows Command Prompt: %s", run_command))
+      
+      # Best-effort: copy the command straight to the clipboard so there's
+      # nothing to select -- just switch to the Command Prompt and paste.
+      # Some locked-down browser/security setups block clipboard access
+      # outright, so this can silently fail -- the command is still shown
+      # above (and in the notification below) either way, for manual copy.
+      if (requireNamespace("jsonlite", quietly = TRUE)) {
+        shinyjs::runjs(sprintf(
+          "navigator.clipboard.writeText(%s).catch(function(e) { console.log('Clipboard copy failed:', e); });",
+          jsonlite::toJSON(run_command, auto_unbox = TRUE)
+        ))
+      }
+      
+      showNotification(sprintf("Script created and command copied to clipboard. Paste it into a Windows Command Prompt: %s", run_command),
+                       type = "message", duration = 20)
+      return(invisible(NULL))
     }
-    if (!file.exists(input$rscript_path)) {
-      showNotification("Rscript path is not valid. Fix it in the sidebar first.", type = "error")
+    
+    if (!file.exists(effective_rscript_path())) {
+      showNotification("Rscript path is not valid. Fix it in Advanced settings first.", type = "error")
       return(invisible(NULL))
     }
     if (isTRUE(input$clean_library) && is.null(rv$clean_lib_dir)) {
       rv$clean_lib_dir <- file.path(tempdir(), paste0("clean_rlib_", format(Sys.time(), "%Y%m%d_%H%M%S")))
       dir.create(rv$clean_lib_dir, recursive = TRUE, showWarnings = FALSE)
-      add_log(paste0("Clean library created: ", rv$clean_lib_dir,
-                     " (packages installed during this run will land here, not in the usual site library)"))
+      add_log("Clean package library set up (packages will install fresh during this run).")
     }
     rv$run_queue <- to_run
     rv$run_results <- list()
+    add_log(sprintf("Queued %d program(s) to run%s.", length(rv$run_queue),
+                    if (isTRUE(input$clean_library)) " with a CLEAN package library" else ""))
+    
+    if (isTRUE(input$clean_library)) {
+      # A clean library has zero packages, so first make everything the
+      # programs need available: company packages from the programs folder,
+      # public ones from the company-configured repo. No user input needed.
+      boot_script <- file.path(tempdir(), "bootstrap_packages.R")
+      writeLines(bootstrap_script_lines(file.path(effective_dest_root(), PROGRAMS_SUBDIR),
+                                        deparse(rv$clean_lib_dir), get_package_repos(), to_run,
+                                        isTRUE(input$use_pinned_versions)),
+                 boot_script)
+      rv$bootstrap_log <- file.path(tempdir(), paste0("bootstrap_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".log"))
+      launch <- build_launch_args(boot_script, TRUE, rv$clean_lib_dir)
+      rv$bootstrap_proc <- tryCatch(
+        processx::process$new(effective_rscript_path(), args = c(launch$flags, launch$script),
+                              env = launch$env, wd = dirname(boot_script),
+                              stdout = rv$bootstrap_log, stderr = rv$bootstrap_log),
+        error = function(e) { add_log(paste0("ERROR launching package preparation: ", conditionMessage(e))); NULL })
+      if (!is.null(rv$bootstrap_proc)) {
+        add_log("Preparing packages first (company packages from the programs folder, public ones from the configured repo)...")
+        return(invisible(NULL))
+      }
+    }
     rv$run_active <- TRUE
-    add_log(sprintf("Queued %d program(s) to run%s%s.", length(rv$run_queue),
-                    if (isTRUE(input$clean_library)) " with a CLEAN package library" else "",
-                    if (using_loa) " (LOA Y/Y filter)" else ""))
   })
   
   observeEvent(input$reset_clean_lib, {
     if (!is.null(rv$clean_lib_dir) && dir.exists(rv$clean_lib_dir)) {
       unlink(rv$clean_lib_dir, recursive = TRUE)
+    }
+    win_lib_linux <- file.path(normalize_prefix(Sys.getenv("HOME")), WIN_LIB_DIRNAME)
+    if (dir.exists(win_lib_linux)) {
+      unlink(win_lib_linux, recursive = TRUE)
+      add_log(sprintf("Removed the dedicated Windows package library (%s).", WIN_LIB_DIRNAME))
     }
     rv$clean_lib_dir <- NULL
     add_log("Clean library reset -- the next run will start with zero pre-installed packages again.")
@@ -959,6 +1736,11 @@ server <- function(input, output, session) {
   })
   
   observeEvent(input$stop_btn, {
+    if (!is.null(rv$bootstrap_proc) && rv$bootstrap_proc$is_alive()) {
+      rv$bootstrap_proc$kill()
+      rv$bootstrap_proc <- NULL
+      add_log("Package preparation stopped by user.")
+    }
     if (!is.null(rv$run_current_proc) && rv$run_current_proc$is_alive()) {
       rv$run_current_proc$kill()
       add_log(paste0("Killed running program: ", basename(rv$run_current_program)))
@@ -969,6 +1751,16 @@ server <- function(input, output, session) {
   })
   
   run_timer <- reactiveTimer(700)
+  observe({
+    run_timer()
+    proc <- rv$bootstrap_proc
+    if (is.null(proc) || proc$is_alive()) return(invisible(NULL))
+    txt <- tryCatch(paste(readLines(rv$bootstrap_log, warn = FALSE), collapse = "\n"), error = function(e) "")
+    lines <- grep("^\\[bootstrap\\]", strsplit(txt, "\n", fixed = TRUE)[[1]], value = TRUE)
+    if (length(lines) > 0) add_log(paste(lines, collapse = "\n"))
+    rv$bootstrap_proc <- NULL
+    if (length(rv$run_queue) > 0) rv$run_active <- TRUE
+  })
   observe({
     run_timer()
     if (!isTRUE(rv$run_active)) return(invisible(NULL))
@@ -988,7 +1780,13 @@ server <- function(input, output, session) {
             # dependent characters, garbled output from a crashing package,
             # etc.) -- replace invalid byte sequences instead of letting
             # downstream string ops (trimws, sub, ...) throw on them.
-            iconv(raw, from = "UTF-8", to = "UTF-8", sub = "byte")
+            sanitized <- iconv(raw, from = "UTF-8", to = "UTF-8", sub = "byte")
+            # Show the ORIGINAL hardcoded path (e.g. "C:/submission_files/...")
+            # in place of the local test root, so an error/warning naming a
+            # file path reads as a direct, actionable statement about the
+            # real path -- not a Linux path the person has to mentally
+            # translate back themselves.
+            restore_hardcoded_path_in_text(sanitized, effective_dest_root(), hardcoded_path())
           }, error = function(e) "")
           
           rv$run_results[[prog_name]] <- list(
@@ -1035,7 +1833,7 @@ server <- function(input, output, session) {
       launch <- build_launch_args(next_prog, input$clean_library, rv$clean_lib_dir)
       proc <- tryCatch({
         processx::process$new(
-          input$rscript_path,
+          effective_rscript_path(),
           # NOTE: do NOT shQuote() here -- processx passes args directly to the
           # OS process (no shell involved), so shell-quoting would inject
           # literal quote characters into the path and break it.
@@ -1080,20 +1878,46 @@ server <- function(input, output, session) {
   
   observeEvent(input$check_btn, {
     output_dir <- file.path(effective_dest_root(), OUTPUT_SUBDIR)
+    source_output_dir <- file.path(normalize_prefix(input$copy_from_path), OUTPUT_SUBDIR)
     out_exts <- OUTPUT_EXTENSIONS
     
-    programs_ran <- if (length(rv$run_results) > 0) {
-      lapply(rv$run_results, function(x) x)
+    d <- loa_data()
+    target_programs <- if (!is.null(d) && length(d$all_yy) > 0) {
+      # Every LOA-required program, regardless of whether its .R file was
+      # actually found locally -- checking OUTPUT doesn't require the
+      # program itself to be present (e.g. outputs copied in directly).
+      d$all_yy
+    } else if (length(rv$run_results) > 0) {
+      names(rv$run_results)
     } else {
-      # If nothing was run in this session yet, fall back to all discovered programs
-      lapply(rv$programs, function(p) list(program = basename(p), status = "NOT_RUN_THIS_SESSION",
-                                           exit_code = NA, seconds = NA, start_time = NA))
+      basename(rv$programs)
     }
+    
+    programs_ran <- lapply(target_programs, function(prog_name) {
+      base <- tools::file_path_sans_ext(basename(prog_name))
+      # Match against actual run results case/extension-insensitively,
+      # since LOA-listed names don't always include ".R" or exact case.
+      run_key <- names(rv$run_results)[
+        tolower(tools::file_path_sans_ext(names(rv$run_results))) == tolower(base)
+      ]
+      if (length(run_key) > 0) {
+        rv$run_results[[run_key[1]]]
+      } else {
+        list(program = base, status = "NOT_RUN_THIS_SESSION",
+             exit_code = NA, seconds = NA, start_time = NA)
+      }
+    })
     
     rows <- lapply(programs_ran, function(r) {
       prog_name <- r$program
       run_start <- r$start_time
-      expected <- guess_expected_outputs(prog_name, output_dir, out_exts)
+      
+      # Check the local TEST environment's output first; fall back to the
+      # original source folder's own output (e.g. outputs copied there
+      # directly, without re-running the program locally).
+      expected_test <- guess_expected_outputs(prog_name, output_dir, out_exts)
+      expected_source <- guess_expected_outputs(prog_name, source_output_dir, out_exts)
+      expected <- ifelse(file.exists(expected_test), expected_test, expected_source)
       
       found <- expected[file.exists(expected)]
       exists_ok <- length(found) > 0
@@ -1106,6 +1930,8 @@ server <- function(input, output, session) {
         FALSE
       }
       
+      server_compare <- if (exists_ok) compare_outputs_to_server(found, input$server_output_path) else NA_character_
+      
       data.frame(
         program = prog_name,
         run_status = r$status,
@@ -1113,6 +1939,7 @@ server <- function(input, output, session) {
         output_found = exists_ok,
         output_nonzero = nonzero_ok,
         output_fresh = fresh_ok,
+        server_compare = server_compare,
         stringsAsFactors = FALSE
       )
     })
@@ -1121,6 +1948,77 @@ server <- function(input, output, session) {
     n_ok <- sum(rv$completeness_result$output_found & rv$completeness_result$output_nonzero, na.rm = TRUE)
     add_log(sprintf("Output check complete: %d/%d program(s) have a non-empty expected output present.",
                     n_ok, nrow(rv$completeness_result)))
+    
+    sc <- rv$completeness_result$server_compare
+    n_diff <- sum(grepl("DIFFERENT", sc), na.rm = TRUE)
+    n_missing <- sum(grepl("SERVER_MISSING", sc), na.rm = TRUE)
+    n_compared <- sum(!is.na(sc) & sc != "SERVER_PATH_NOT_FOUND")
+    if (n_compared > 0) {
+      add_log(sprintf("Server comparison: %d file(s) differ, %d not found on server, out of %d compared.",
+                      n_diff, n_missing, n_compared))
+    }
+  })
+  
+  # Independent of run_results/run_btn -- works directly off whatever ARDS
+  # files already exist on disk, for the LOA-required program pool. No need
+  # to re-run programs just to re-check against the server.
+  observeEvent(input$compare_ards_btn, {
+    d <- loa_data()
+    if (is.null(d) || length(d$all_yy) == 0) {
+      showNotification("Load the LOA first (see step 1) so this knows which programs to compare.", type = "warning")
+      return(invisible(NULL))
+    }
+    
+    # Strictly use "1. Submission Program Folder"'s own output -- NOT this
+    # tool's own local test run. The test run executes under whatever R
+    # engine is running this app (e.g. the Linux Posit Workbench engine
+    # when accessed via the browser, even through a Windows/Citrix client),
+    # which can give numerically different results than a genuine Windows
+    # RStudio run (different BLAS/LAPACK, package versions, RNG behavior in
+    # multiple-imputation steps, etc.). Comparing the program folder's own
+    # pre-existing output against the server avoids that confound.
+    source_output_dir <- file.path(normalize_prefix(input$copy_from_path), OUTPUT_SUBDIR)
+    server_dir <- input$server_output_path
+    server_ok <- !is.null(server_dir) && nzchar(trimws(server_dir)) && dir.exists(server_dir)
+    
+    # Compute the full itemized detail ONCE per program (not twice) -- the
+    # on-screen one-line-per-program summary is then just the first row of
+    # that same detail, so both views come from a single comparison pass.
+    per_program <- lapply(d$all_yy, function(prog_name) {
+      base <- tools::file_path_sans_ext(basename(prog_name))
+      ards_name <- paste0(base, "_ards.csv")
+      local_csv <- file.path(source_output_dir, ards_name)
+      
+      detail <- if (!server_ok) {
+        data.frame(row = NA_integer_, column = NA_character_,
+                   local_value = NA_character_, server_value = NA_character_,
+                   status = "SERVER_PATH_NOT_FOUND", stringsAsFactors = FALSE)
+      } else {
+        compare_ards_to_server_detail(local_csv, file.path(server_dir, ards_name))
+      }
+      
+      summary_result <- if (nrow(detail) == 1 && is.na(detail$row[1])) {
+        detail$status[1]
+      } else {
+        sprintf("DIFFERENT (row %d, col '%s': local='%s' vs server='%s')",
+                detail$row[1], detail$column[1], detail$local_value[1], detail$server_value[1])
+      }
+      
+      list(summary = data.frame(program = base, result = summary_result, stringsAsFactors = FALSE),
+           detail = cbind(program = base, detail, stringsAsFactors = FALSE))
+    })
+    
+    rv$ards_compare_result <- do.call(rbind, lapply(per_program, `[[`, "summary"))
+    rv$ards_compare_detail <- do.call(rbind, lapply(per_program, `[[`, "detail"))
+    
+    n_match <- sum(rv$ards_compare_result$result == "MATCH")
+    add_log(sprintf("Server comparison: %d/%d program(s) matched the server version.",
+                    n_match, nrow(rv$ards_compare_result)))
+  })
+  
+  output$ards_compare_table <- renderDT({
+    req(rv$ards_compare_result)
+    datatable(rv$ards_compare_result, options = list(pageLength = 10), rownames = FALSE)
   })
   
   output$completeness_table <- renderDT({
@@ -1133,6 +2031,14 @@ server <- function(input, output, session) {
     content = function(file) {
       req(rv$completeness_result)
       write.csv(rv$completeness_result, file, row.names = FALSE)
+    }
+  )
+  
+  output$save_ards_report_btn <- downloadHandler(
+    filename = function() paste0("output_comparison_report_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv"),
+    content = function(file) {
+      req(rv$ards_compare_detail)
+      write.csv(rv$ards_compare_detail, file, row.names = FALSE)
     }
   )
 }
